@@ -1,0 +1,11 @@
+libretro-rollback
+Copyright 2026 Nathan Fallet
+
+This product includes software developed by GroundStorm Studios, LLC
+(GGPO.net, https://github.com/pond3r/ggpo), used under the MIT license;
+the full text is in LICENSE-GGPO.
+The rollback engine in this repository is a Kotlin implementation of the
+GGPO algorithm (input queue, prediction, rollback, state ring, checksums,
+timesync and redundant UDP input packets). No source code from
+Ekspym/Tekken6-native-online is included; that project was used as a
+behavioural reference only.

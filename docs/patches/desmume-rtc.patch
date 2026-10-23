@@ -1,0 +1,139 @@
+diff --git a/desmume/src/frontend/libretro/libretro.cpp b/desmume/src/frontend/libretro/libretro.cpp
+index 2314af9..6df02da 100644
+--- a/desmume/src/frontend/libretro/libretro.cpp
++++ b/desmume/src/frontend/libretro/libretro.cpp
+@@ -1,4 +1,7 @@
+ #include <stdarg.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <libretro.h>
+ 
+ #if defined(VITA)
+@@ -2295,6 +2298,54 @@ size_t retro_serialize_size (void)
+     return 1024 * 1024 * 12;
+ }
+ 
++// --- libretro-rollback: dirty pages of the serialized state --------------------------------
++// The rollback delta ring can skip its page scan when the core reports which 4 KiB pages of the
++// serialized buffer changed since the previous save. Both peers must use this patched build; the
++// symbol is optional for the frontend (a stock core does not export it).
++static uint8_t* t6_prev_state = NULL;
++static size_t t6_prev_size = 0;
++static uint8_t* t6_dirty_pages = NULL;
++static size_t t6_dirty_count = 0;
++static int t6_dirty_valid = 0;
++
++extern "C" size_t t6_rollback_dirty_pages(uint8_t* out, size_t pages)
++{
++    if (!out || !t6_dirty_valid || pages < t6_dirty_count)
++        return 0;
++    memcpy(out, t6_dirty_pages, t6_dirty_count);
++    return t6_dirty_count;
++}
++
++static void t6_track_dirty(const uint8_t* data, size_t size)
++{
++    const size_t pages = (size + 4095) / 4096;
++
++    if (!t6_prev_state || t6_prev_size < size)
++    {
++        free(t6_prev_state);
++        t6_prev_state = (uint8_t*)malloc(pages * 4096);
++        t6_prev_size = size;
++        t6_dirty_valid = 0;
++    }
++    if (!t6_dirty_pages || t6_dirty_count < pages)
++    {
++        free(t6_dirty_pages);
++        t6_dirty_pages = (uint8_t*)malloc(pages);
++        t6_dirty_count = pages;
++    }
++
++    for (size_t page = 0; page < pages; page++)
++    {
++        const size_t offset = page * 4096;
++        const size_t length = (offset + 4096 <= size) ? 4096 : (size - offset);
++        t6_dirty_pages[page] = (!t6_dirty_valid ||
++            memcmp(data + offset, t6_prev_state + offset, length) != 0) ? 1 : 0;
++    }
++    memcpy(t6_prev_state, data, size);
++    t6_prev_size = size;
++    t6_dirty_valid = 1;
++}
++
+ bool retro_serialize(void *data, size_t size)
+ {
+     EMUFILE_MEMORY state;
+@@ -2303,6 +2354,7 @@ bool retro_serialize(void *data, size_t size)
+     if(state.size() <= size)
+     {
+         memcpy(data, state.buf(), state.size());
++        t6_track_dirty((const uint8_t*)data, state.size());
+         return true;
+     }
+ 
+@@ -2311,6 +2363,9 @@ bool retro_serialize(void *data, size_t size)
+ 
+ bool retro_unserialize(const void * data, size_t size)
+ {
++    // The tracking baseline no longer matches the machine after a load: the next save marks every
++    // page dirty, which is conservative and correct.
++    t6_dirty_valid = 0;
+     EMUFILE_MEMORY state(const_cast<void*>(data), size);
+     return savestate_load(state);
+ }
+diff --git a/desmume/src/rtc.cpp b/desmume/src/rtc.cpp
+index 1fed7c1..4d4b5e1 100644
+--- a/desmume/src/rtc.cpp
++++ b/desmume/src/rtc.cpp
+@@ -53,6 +53,11 @@ typedef struct
+ 	u8	data[8];
+ 
+ 	u8 cmdBitsSize[8];
++
++	// Deterministic time base (rollback netcode): the RTC advances from emulated frames, not
++	// from the host clock. Both fields are part of the savestate.
++	s64 baseTicks;
++	u64 baseFrame;
+ } _RTC;
+ 
+ _RTC	rtc;
+@@ -79,6 +84,9 @@ SFORMAT SF_RTC[]={
+ 
+ 	{ "R160", 1, 8, &rtc.cmdBitsSize[0]},
+ 
++	{ "R170", 8, 1, &rtc.baseTicks},
++	{ "R180", 8, 1, &rtc.baseFrame},
++
+ 	{ 0 }
+ };
+ 
+@@ -94,7 +102,15 @@ bool moviemode=false;
+ DateTime rtcGetTime(void)
+ {
+ 	if(movieMode == MOVIEMODE_INACTIVE) {
+-		return DateTime::get_Now().AddHours(rtcHourOverride);
++		// Deterministic RTC: advance from emulated frames since the saved base, never from the
++		// host clock. This keeps save/load, replay and rollback identical on every machine.
++		const u32 arm9rate_unitsperframe = 560190 << 1;
++		const u32 arm9rate_unitspersecond = (u32)(arm9rate_unitsperframe * 59.8261);
++		const u64 delta = currFrameCounter >= rtc.baseFrame ? currFrameCounter - rtc.baseFrame : 0;
++		const u64 totalcycles = (u64)arm9rate_unitsperframe * delta;
++		const u64 totalseconds = totalcycles / arm9rate_unitspersecond;
++		DateTime timer(rtc.baseTicks);
++		return timer.AddSeconds(totalseconds).AddHours(rtcHourOverride);
+ 	}
+ 	else {
+ 		//now, you might think it is silly to go through all these conniptions
+@@ -248,6 +264,10 @@ void rtcInit()
+ 	memcpy(&rtc.cmdBitsSize[0],kDefaultCmdBitsSize,8);
+ 
+ 	rtc.regStatus1 |= 0x02;
++
++	// Fixed, frame-based time base: every machine and every replay sees the same clock.
++	rtc.baseTicks = DateTime(2026, 1, 1, 0, 0, 0).get_Ticks();
++	rtc.baseFrame = 0;
+ }
+ 
+ u16 rtcRead() 

@@ -1,0 +1,292 @@
+diff --git a/src/RTC.cpp b/src/RTC.cpp
+index 905a8d8..044e856 100644
+--- a/src/RTC.cpp
++++ b/src/RTC.cpp
+@@ -23,6 +23,7 @@
+ #include <string.h>
+ #include <time.h>
+ #include "RTC.h"
++#include "NDS.h"
+ 
+ 
+ namespace RTC
+@@ -47,6 +48,11 @@ u8 Alarm2[3];
+ u8 ClockAdjust;
+ u8 FreeReg;
+ 
++// Deterministic time base (rollback netcode): the RTC advances from emulated frames instead of
++// reading the host clock on every access. Both fields are part of the savestate.
++u64 BaseTime;
++u32 BaseFrame;
++
+ 
+ bool Init()
+ {
+@@ -74,6 +80,11 @@ void Reset()
+     memset(Alarm2, 0, sizeof(Alarm2));
+     ClockAdjust = 0;
+     FreeReg = 0;
++
++    // Fixed epoch (2026-01-01 00:00:00 UTC) and the frame it was set on: every machine, replay and
++    // rollback sees the same clock. The RTC then advances with NDS::NumFrames, which is saved.
++    BaseTime = 1767225600;
++    BaseFrame = NDS::NumFrames;
+ }
+ 
+ void DoSavestate(Savestate* file)
+@@ -98,6 +109,9 @@ void DoSavestate(Savestate* file)
+     file->VarArray(Alarm2, sizeof(Alarm2));
+     file->Var8(&ClockAdjust);
+     file->Var8(&FreeReg);
++
++    file->Var64(&BaseTime);
++    file->Var32(&BaseFrame);
+ }
+ 
+ 
+@@ -106,6 +120,15 @@ u8 BCD(u8 val)
+     return (val % 10) | ((val / 10) << 4);
+ }
+ 
++// Emulated wall clock: fixed base plus one second per 60 frames. gmtime_r keeps it independent of
++// the host timezone, so two peers always agree.
++static void GetTime(struct tm& timedata)
++{
++    const s64 elapsed = (s64)NDS::NumFrames - (s64)BaseFrame;
++    time_t timestamp = (time_t)((s64)BaseTime + (elapsed > 0 ? elapsed / 60 : 0));
++    gmtime_r(&timestamp, &timedata);
++}
++
+ 
+ void ByteIn(u8 val)
+ {
+@@ -128,9 +151,8 @@ void ByteIn(u8 val)
+ 
+             case 0x20:
+                 {
+-                    time_t timestamp = time(NULL);
+                     struct tm timedata;
+-                    localtime_r(&timestamp, &timedata);
++                    GetTime(timedata);
+ 
+                     Output[0] = BCD(timedata.tm_year - 100);
+                     Output[1] = BCD(timedata.tm_mon + 1);
+@@ -144,9 +166,8 @@ void ByteIn(u8 val)
+ 
+             case 0x60:
+                 {
+-                    time_t timestamp = time(NULL);
+                     struct tm timedata;
+-                    localtime_r(&timestamp, &timedata);
++                    GetTime(timedata);
+ 
+                     Output[0] = BCD(timedata.tm_hour);
+                     Output[1] = BCD(timedata.tm_min);
+diff --git a/src/libretro/libretro.cpp b/src/libretro/libretro.cpp
+index 2207849..7034890 100644
+--- a/src/libretro/libretro.cpp
++++ b/src/libretro/libretro.cpp
+@@ -1,4 +1,7 @@
+ #include <ctime>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
+@@ -966,13 +969,63 @@ size_t retro_serialize_size(void)
+ 
+ }
+ 
++// --- libretro-rollback: dirty pages of the serialized state --------------------------------
++// The rollback delta ring can skip its page scan when the core reports which 4 KiB pages of the
++// serialized buffer changed since the previous save. Both peers must use this patched build; the
++// symbol is optional for the frontend (a stock core does not export it).
++static uint8_t* t6_prev_state = NULL;
++static size_t t6_prev_size = 0;
++static uint8_t* t6_dirty_pages = NULL;
++static size_t t6_dirty_count = 0;
++static int t6_dirty_valid = 0;
++
++extern "C" size_t t6_rollback_dirty_pages(uint8_t* out, size_t pages)
++{
++   if (!out || !t6_dirty_valid || pages < t6_dirty_count)
++      return 0;
++   std::memcpy(out, t6_dirty_pages, t6_dirty_count);
++   return t6_dirty_count;
++}
++
++static void t6_track_dirty(const uint8_t* data, size_t size)
++{
++   const size_t pages = (size + 4095) / 4096;
++
++   if (!t6_prev_state || t6_prev_size < size)
++   {
++      std::free(t6_prev_state);
++      t6_prev_state = (uint8_t*)std::malloc(pages * 4096);
++      t6_prev_size = size;
++      t6_dirty_valid = 0;
++   }
++   if (!t6_dirty_pages || t6_dirty_count < pages)
++   {
++      std::free(t6_dirty_pages);
++      t6_dirty_pages = (uint8_t*)std::malloc(pages);
++      t6_dirty_count = pages;
++   }
++
++   for (size_t page = 0; page < pages; page++)
++   {
++      const size_t offset = page * 4096;
++      const size_t length = (offset + 4096 <= size) ? 4096 : (size - offset);
++      t6_dirty_pages[page] = (!t6_dirty_valid ||
++         std::memcmp(data + offset, t6_prev_state + offset, length) != 0) ? 1 : 0;
++   }
++   std::memcpy(t6_prev_state, data, size);
++   t6_prev_size = size;
++   t6_dirty_valid = 1;
++}
++
+ bool retro_serialize(void *data, size_t size)
+ {
+    if (NDS::ConsoleType == 0)
+    {
+       Savestate* savestate = new Savestate(data, size, true);
+       NDS::DoSavestate(savestate);
++      const size_t written = savestate->GetOffset();
+       delete savestate;
++      t6_track_dirty((const uint8_t*)data, written);
+ 
+       return true;
+    }
+@@ -987,6 +1040,9 @@ bool retro_unserialize(const void *data, size_t size)
+ {
+    if (NDS::ConsoleType == 0)
+    {
++      // The tracking baseline no longer matches the machine after a load: the next save marks every
++      // page dirty, which is conservative and correct.
++      t6_dirty_valid = 0;
+       Savestate* savestate = new Savestate((void*)data, size, false);
+       NDS::DoSavestate(savestate);
+       delete savestate;
+diff --git a/src/libretro/platform.cpp b/src/libretro/platform.cpp
+index 3a4f6f6..a8a4be4 100644
+--- a/src/libretro/platform.cpp
++++ b/src/libretro/platform.cpp
+@@ -68,10 +68,33 @@ extern char retro_base_directory[4096];
+ 
+ #define NIFI_VER 1
+ 
+-socket_t MPSocket;
++socket_t MPSocket = INVALID_SOCKET;
+ sockaddr_t MPSendAddr;
+ u8 PacketBuffer[2048];
+ 
++// --- libretro-rollback: frontend-routed local wireless ------------------------------------------
++// Linked netplay runs one console per process, so the broadcast socket is not enough: the peer's
++// radio packets must be delivered at an emulated frame boundary, otherwise the two consoles see
++// different radio timing and drift apart. When the frontend installs these callbacks the MP radio
++// routes through it and no socket is opened (two linked instances may share a machine).
++// See libretro-rollback's docs/two-console.md.
++typedef int (*t6_link_send_fn)(const u8* data, int len);
++typedef int (*t6_link_recv_fn)(u8* data, int len);
++
++static t6_link_send_fn t6_link_send_cb = NULL;
++static t6_link_recv_fn t6_link_recv_cb = NULL;
++
++extern "C" void t6_link_set_callbacks(t6_link_send_fn send, t6_link_recv_fn recv)
++{
++   t6_link_send_cb = send;
++   t6_link_recv_cb = recv;
++   if ((send || recv) && MPSocket != INVALID_SOCKET)
++   {
++      closesocket(MPSocket);
++      MPSocket = INVALID_SOCKET;
++   }
++}
++
+ namespace Platform
+ {
+     FILE* OpenFile(const char* path, const char* mode, bool mustexist)
+@@ -227,6 +250,10 @@ namespace Platform
+       int opt_true = 1;
+       int res;
+ 
++      // The frontend drives the radio: no socket, no broadcast.
++      if (t6_link_send_cb || t6_link_recv_cb)
++         return true;
++
+ #ifdef _WIN32
+       WSADATA wsadata;
+       if (WSAStartup(MAKEWORD(2, 2), &wsadata) != 0)
+@@ -278,8 +305,11 @@ namespace Platform
+ 
+    void MP_DeInit()
+    {
+-      if (MPSocket >= 0)
++      if (MPSocket != INVALID_SOCKET)
++      {
+          closesocket(MPSocket);
++         MPSocket = INVALID_SOCKET;
++      }
+ 
+ #ifdef _WIN32
+       WSACleanup();
+@@ -288,6 +318,16 @@ namespace Platform
+ 
+    int MP_SendPacket(u8* data, int len)
+    {
++      if (t6_link_send_cb)
++      {
++         if (len <= 0 || len > 2048-8)
++         {
++            printf("MP_SendPacket: error: packet too long (%d)\n", len);
++            return 0;
++         }
++         return t6_link_send_cb(data, len);
++      }
++
+       if (MPSocket < 0)
+       {
+          printf("MP_SendPacket: early return (%d)\n", len);
+@@ -314,6 +354,14 @@ namespace Platform
+ 
+    int MP_RecvPacket(u8* data, bool block)
+    {
++      if (t6_link_recv_cb)
++      {
++         // The frontend owns the queue and the framing; nothing to strip here.
++         int rlen = t6_link_recv_cb(data, 2048);
++         if (rlen <= 0 || rlen > 2048) return 0;
++         return rlen;
++      }
++
+       if (MPSocket < 0)
+       {
+          printf("MP_RecvPacket: early return\n");
+@@ -429,4 +477,26 @@ namespace Platform
+    {
+       retro_sleep(usecs / 1000);
+    }
++
++// --- libretro-rollback: link ABI diagnostic -----------------------------------------------------
++// Round-trips a probe through the very routing MP_SendPacket / MP_RecvPacket use, so an integration
++// test can prove the frontend callbacks are wired without needing a game that is inside a local
++// wireless screen. Returns bit 0 when the radio transmitted the probe, bit 1 when the radio received
++// it back, and 0 when no callbacks are installed. See libretro-rollback's docs/two-console.md.
++extern "C" int t6_link_selftest()
++{
++   static const u8 probe[4] = { 0x54, 0x36, 0x4C, 0x4B }; // "T6LK"
++   u8 buffer[2048];
++   int result = 0;
++
++   if (Platform::MP_SendPacket((u8*)probe, 4) == 4)
++      result |= 1;
++
++   int length = Platform::MP_RecvPacket(buffer, false);
++   if (length == 4 && memcmp(buffer, probe, 4) == 0)
++      result |= 2;
++
++   return result;
++}
++
+ };
