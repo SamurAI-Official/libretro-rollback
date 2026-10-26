@@ -57,6 +57,14 @@ class RollbackSession(
     private enum class State { IDLE, HANDSHAKING, SYNCHRONIZED, CLOSED }
 
     private val sessionId: Int = Random.nextInt().let { if (it == 0) 1 else it }
+
+    /**
+     * Random token this peer puts in every packet (see [Packet.token]). The peer pins it after the
+     * first HELLO; anything without it is dropped, so a third party that only learned the session id
+     * (which is in every packet and therefore easier to obtain) cannot inject inputs.
+     */
+    private val sessionToken: Long = Random.nextLong().let { if (it == 0L) 1L else it }
+    private var peerToken = 0L
     private val ring: SnapshotRing = when (config.snapshotStrategy) {
         SnapshotStrategy.FULL -> StateRing(core, config)
         SnapshotStrategy.DELTA -> DeltaStateRing(core, config)
@@ -326,6 +334,18 @@ class RollbackSession(
     }
 
     /**
+     * True when both peers simulate the same console, so a per-frame state checksum is meaningful.
+     * Linked play runs two consoles whose RAM legitimately differs (different player data), so its
+     * checksums are not exchanged; see [RollbackConfig.linkChecksums] and the integrity note in the
+     * README (linked-play integrity needs the relay/replay tier, not a same-simulation checksum).
+     */
+    private val canExchangeChecksums: Boolean get() = link == null || config.linkChecksums
+
+    /** The checksum to put in a packet for [frame], or 0 when there is no shared simulation to compare. */
+    private fun stateChecksum(frame: Int): Int =
+        if (canExchangeChecksums) ring.checksum(frame)?.toInt() ?: 0 else 0
+
+    /**
      * Compares the checksums the peer reported with the local state, once the local simulation of the
      * frame is *settled*: every input the peer sent for it has arrived, and any correction has already
      * been replayed (this runs after [checkSimulation]). Comparing earlier would compare a state built
@@ -335,6 +355,7 @@ class RollbackSession(
      * not reached yet stays queued.
      */
     private fun verifyChecksums() {
+        if (!canExchangeChecksums) return
         while (true) {
             val entry = pendingChecksums.firstOrNull() ?: break
             val (peerFrame, peerChecksum) = entry
@@ -396,7 +417,9 @@ class RollbackSession(
         closed = true
         if (state == State.SYNCHRONIZED || state == State.HANDSHAKING) {
             remote?.let { endpoint ->
-                val packet = ProtocolMessages.bye(sessionId, localPlayer, config.players, config.inputSize, "closed")
+                val packet = ProtocolMessages.bye(
+                    sessionId, sessionToken, localPlayer, config.players, config.inputSize, "closed",
+                )
                 transport.send(packet, 0, packet.size, endpoint)
             }
         }
@@ -422,14 +445,16 @@ class RollbackSession(
             linkEnabled = link != null,
             linkDelay = if (link != null) config.linkDelayFrames else 0,
         )
-        val packet = ProtocolMessages.hello(sessionId, localPlayer, config.players, config.inputSize, hello)
+        val packet = ProtocolMessages.hello(sessionId, sessionToken, localPlayer, config.players, config.inputSize, hello)
         transport.send(packet, 0, packet.size, endpoint)
         lastHelloMillis = nowMillis()
     }
 
     private fun sendSimple(type: Int) {
         val endpoint = remote ?: return
-        val packet = ProtocolMessages.simple(type, sessionId, localPlayer, config.players, config.inputSize)
+        val packet = ProtocolMessages.simple(
+            type, sessionId, sessionToken, localPlayer, config.players, config.inputSize,
+        )
         transport.send(packet, 0, packet.size, endpoint)
     }
 
@@ -440,6 +465,9 @@ class RollbackSession(
 
     private fun onHello(packet: Packet) {
         val hello = ProtocolMessages.decodeHello(packet.payload) ?: return
+        // A HELLO replayed later (or forged) cannot take over the session: once the peer's token is
+        // pinned, only that token is accepted, and a HELLO with another one is ignored.
+        if (peerHello && packet.token != peerToken) return
         peerSessionId = packet.sessionId
         if (!peerHello) {
             val reason = validate(hello)
@@ -450,6 +478,7 @@ class RollbackSession(
             }
             peerHello = true
             peerPlayer = packet.player
+            peerToken = packet.token
         }
         sendSimple(PacketType.HELLO_ACK)
         sendStart()
@@ -513,7 +542,12 @@ class RollbackSession(
 
     private fun drain() {
         for (datagram in transport.receive()) {
+            // Only the peer we started the session with is heard, whatever the packet carries: a
+            // third party that can reach the port cannot pretend to be it (see [Packet.token] for
+            // the second lock).
+            if (!isFromPeer(datagram.from)) continue
             val packet = Protocol.decode(datagram.data, datagram.length) ?: continue
+            if (packet.type != PacketType.HELLO && packet.token != peerToken) continue
             if (packet.type != PacketType.HELLO &&
                 packet.sessionId != sessionId &&
                 packet.sessionId != peerSessionId
@@ -535,10 +569,23 @@ class RollbackSession(
         }
     }
 
+    /**
+     * True when [from] is the endpoint the session was started with. The port always has to match;
+     * the host is compared when the configured peer is an IP literal, and left out when it is a name
+     * (the resolved address the transport reports may differ from the name). The session token is what
+     * actually authenticates the peer.
+     */
+    private fun isFromPeer(from: Endpoint): Boolean {
+        val remote = remote ?: return false
+        if (from.port != remote.port) return false
+        if (remote.host.any { it.isLetter() }) return true
+        return from.host == remote.host
+    }
+
     private fun onInput(packet: Packet) {
         if (state != State.SYNCHRONIZED) return
         if (packet.player == localPlayer || packet.player !in 0 until config.players) return
-        if (packet.checksum != 0 && packet.ackFrame >= 0) {
+        if (canExchangeChecksums && packet.checksum != 0 && packet.ackFrame >= 0) {
             pendingChecksums.addLast(packet.ackFrame to packet.checksum)
             trimPendingChecksums()
         }
@@ -568,7 +615,7 @@ class RollbackSession(
         if (packet.player == localPlayer) return
         val payload = ProtocolMessages.decodeLink(packet.payload) ?: return
         if (payload.epoch < peerLinkEpoch) return
-        if (packet.checksum != 0 && packet.ackFrame >= 0) {
+        if (canExchangeChecksums && packet.checksum != 0 && packet.ackFrame >= 0) {
             pendingChecksums.addLast(packet.ackFrame to packet.checksum)
             trimPendingChecksums()
         }
@@ -643,12 +690,13 @@ class RollbackSession(
         val settled = settledFrame()
         val packet = ProtocolMessages.input(
             sessionId = sessionId,
+            token = sessionToken,
             player = localPlayer,
             players = config.players,
             inputSize = config.inputSize,
             frame = frame,
             ackFrame = settled,
-            checksum = ring.checksum(settled)?.toInt() ?: 0,
+            checksum = stateChecksum(settled),
             startFrame = first,
             inputs = inputs,
             count = count,
@@ -673,12 +721,13 @@ class RollbackSession(
         val settled = settledFrame()
         val packet = ProtocolMessages.link(
             sessionId = sessionId,
+            token = sessionToken,
             player = localPlayer,
             players = config.players,
             inputSize = config.inputSize,
             frame = frame,
             ackFrame = settled,
-            checksum = ring.checksum(settled)?.toInt() ?: 0,
+            checksum = stateChecksum(settled),
             epoch = linkEpoch,
             invalidatedFrom = linkInvalidatedFrom,
             batches = batches,

@@ -61,6 +61,20 @@ data class RollbackConfig(
     val snapshotStrategy: SnapshotStrategy = SnapshotStrategy.FULL,
     val deltaKeyframeInterval: Int = 30,
     /**
+     * Compare per-frame state checksums in linked play (off by default).
+     *
+     * Linked play runs two consoles, one per peer: their RAM legitimately differs (each game holds its
+     * own player's data), so the same-simulation comparison of the two-controller topology does not
+     * apply and would report a desync as soon as a real wireless session starts. Leave it off, and
+     * turn it on only for a deterministic echo test where both peers really run the same state.
+     *
+     * With it off, a linked session has no state-desync detection: nothing in a peer-to-peer protocol
+     * can prove that the other console was not modified locally. That is what the relay/replay tier is
+     * for (see the README, "Integrity"), not a checksum over two different machines.
+     */
+    val linkChecksums: Boolean = false,
+
+    /**
      * Save a snapshot for every replayed frame during a rollback (the default). The frames being
      * replayed were simulated with inputs that turned out to be wrong, so their snapshots and
      * checksums describe a run that no longer exists: keeping them would let a later rollback restore

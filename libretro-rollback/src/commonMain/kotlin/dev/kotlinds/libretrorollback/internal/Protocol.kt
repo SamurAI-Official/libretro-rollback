@@ -13,6 +13,12 @@ internal object PacketType {
 internal data class Packet(
     val type: Int,
     val sessionId: Int,
+    /**
+     * The sender's session token, in every packet. Each peer pins the token it first saw in the
+     * peer's HELLO and drops anything that does not carry it, so a third party that knows the
+     * (guessable) session id cannot inject inputs: it would have to know the token too.
+     */
+    val token: Long,
     val player: Int,
     val players: Int,
     val inputSize: Int,
@@ -69,8 +75,13 @@ internal data class LinkPayload(
 
 internal object Protocol {
     const val MAGIC = 0x4B42424C // "LBRK" little-endian
-    const val VERSION = 1
-    const val HEADER_SIZE = 28
+
+    /**
+     * 2: the header carries the sender's session token (see [Packet.token]), so a third party that
+     *    only knows the session id cannot inject packets.
+     */
+    const val VERSION = 2
+    const val HEADER_SIZE = 36
 
     fun encode(packet: Packet): ByteArray {
         val writer = ByteWriter(HEADER_SIZE + packet.payload.size)
@@ -79,6 +90,7 @@ internal object Protocol {
         writer.u8(packet.type)
         writer.u16(0)
         writer.u32(packet.sessionId)
+        writer.u64(packet.token)
         writer.u8(packet.player)
         writer.u8(packet.players)
         writer.u8(packet.inputSize)
@@ -98,6 +110,7 @@ internal object Protocol {
         val type = reader.u8()
         reader.u16()
         val sessionId = reader.u32()
+        val token = reader.u64()
         val player = reader.u8()
         val players = reader.u8()
         val inputSize = reader.u8()
@@ -108,6 +121,7 @@ internal object Protocol {
         return Packet(
             type = type,
             sessionId = sessionId,
+            token = token,
             player = player,
             players = players,
             inputSize = inputSize,

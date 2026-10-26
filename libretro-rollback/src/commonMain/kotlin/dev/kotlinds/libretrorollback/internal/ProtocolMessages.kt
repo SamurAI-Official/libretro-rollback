@@ -1,7 +1,7 @@
 package dev.kotlinds.libretrorollback.internal
 
 internal object ProtocolMessages {
-    fun hello(sessionId: Int, player: Int, players: Int, inputSize: Int, hello: Hello): ByteArray {
+    fun hello(sessionId: Int, token: Long, player: Int, players: Int, inputSize: Int, hello: Hello): ByteArray {
         val payload = ByteWriter(128).apply {
             str(hello.coreName)
             str(hello.coreVersion)
@@ -14,12 +14,15 @@ internal object ProtocolMessages {
             u8(if (hello.linkEnabled) 1 else 0)
             u8(hello.linkDelay)
         }.toByteArray()
-        return Protocol.encode(Packet(PacketType.HELLO, sessionId, player, players, inputSize, 0, -1, 0, payload))
+        return Protocol.encode(
+            Packet(PacketType.HELLO, sessionId, token, player, players, inputSize, 0, -1, 0, payload),
+        )
     }
 
     fun simple(
         type: Int,
         sessionId: Int,
+        token: Long,
         player: Int,
         players: Int,
         inputSize: Int,
@@ -27,10 +30,13 @@ internal object ProtocolMessages {
         ackFrame: Int = -1,
         checksum: Int = 0,
         payload: ByteArray = ByteArray(0),
-    ): ByteArray = Protocol.encode(Packet(type, sessionId, player, players, inputSize, frame, ackFrame, checksum, payload))
+    ): ByteArray = Protocol.encode(
+        Packet(type, sessionId, token, player, players, inputSize, frame, ackFrame, checksum, payload),
+    )
 
     fun input(
         sessionId: Int,
+        token: Long,
         player: Int,
         players: Int,
         inputSize: Int,
@@ -46,7 +52,9 @@ internal object ProtocolMessages {
             u8(count)
             bytes(inputs)
         }.toByteArray()
-        return Protocol.encode(Packet(PacketType.INPUT, sessionId, player, players, inputSize, frame, ackFrame, checksum, payload))
+        return Protocol.encode(
+            Packet(PacketType.INPUT, sessionId, token, player, players, inputSize, frame, ackFrame, checksum, payload),
+        )
     }
 
     /**
@@ -57,6 +65,7 @@ internal object ProtocolMessages {
      */
     fun link(
         sessionId: Int,
+        token: Long,
         player: Int,
         players: Int,
         inputSize: Int,
@@ -82,7 +91,9 @@ internal object ProtocolMessages {
                 }
             }
         }.toByteArray()
-        return Protocol.encode(Packet(PacketType.LINK, sessionId, player, players, inputSize, frame, ackFrame, checksum, payload))
+        return Protocol.encode(
+            Packet(PacketType.LINK, sessionId, token, player, players, inputSize, frame, ackFrame, checksum, payload),
+        )
     }
 
     fun decodeLink(payload: ByteArray): LinkPayload? = runCatching {
@@ -108,6 +119,7 @@ internal object ProtocolMessages {
 
     fun desync(
         sessionId: Int,
+        token: Long,
         player: Int,
         players: Int,
         inputSize: Int,
@@ -120,12 +132,16 @@ internal object ProtocolMessages {
             u64(localChecksum)
             u64(remoteChecksum)
         }.toByteArray()
-        return Protocol.encode(Packet(PacketType.DESYNC, sessionId, player, players, inputSize, frame, -1, 0, payload))
+        return Protocol.encode(
+            Packet(PacketType.DESYNC, sessionId, token, player, players, inputSize, frame, -1, 0, payload),
+        )
     }
 
-    fun bye(sessionId: Int, player: Int, players: Int, inputSize: Int, reason: String): ByteArray {
+    fun bye(sessionId: Int, token: Long, player: Int, players: Int, inputSize: Int, reason: String): ByteArray {
         val payload = ByteWriter(32).apply { str(reason) }.toByteArray()
-        return Protocol.encode(Packet(PacketType.BYE, sessionId, player, players, inputSize, 0, -1, 0, payload))
+        return Protocol.encode(
+            Packet(PacketType.BYE, sessionId, token, player, players, inputSize, 0, -1, 0, payload),
+        )
     }
 
     fun decodeHello(payload: ByteArray): Hello? = runCatching {

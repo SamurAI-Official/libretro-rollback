@@ -47,6 +47,9 @@ for delta snapshots, and a frontend-routed local wireless link for two-console p
 - [x] Incremental snapshots: keyframes + 4 KiB page deltas (`SnapshotStrategy.DELTA`)
 - [x] Core-level dirty-page API (`t6_rollback_dirty_pages`, both patched cores)
 - [x] Linked play: two consoles, local wireless routed through the session (`t6_link_set_callbacks`)
+- [x] Peer authentication: only the started peer's endpoint and session token are heard (protocol v2)
+- [x] Linked play no longer compares same-simulation checksums (two consoles legitimately differ); see
+      [Integrity](#integrity-what-a-peer-to-peer-session-can-and-cannot-prove)
 
 **Read [docs/feasibility.md](docs/feasibility.md) before using rollback with a DS core.**
 Both tested DS cores read their RTC from the host clock; apply
@@ -237,6 +240,40 @@ expose a radio the frontend can drive. What is still out of scope:
 The `pokemon-client-rollback` adapter maps the engine's two input blobs to controller ports 0 and 1.
 Cores that do not use port 1 will ignore the second blob; do not treat that as working two-player
 netplay.
+
+## Integrity: what a peer-to-peer session can and cannot prove
+
+The wire only ever carries **inputs** (fixed-size blobs), state checksums, the handshake metadata and
+(for linked play) radio packets. There is no command channel, and the client library has no
+RAM-write API: an agent or a user can only press buttons and touch the screen, whatever the other
+side sends.
+
+What the session enforces by itself:
+
+- **Only the peer is heard.** A datagram is dropped unless it comes from the endpoint `start()` was
+  given, and (for anything but the first `HELLO`) unless it carries the random 64-bit **session token**
+  that peer sent in its `HELLO`. Knowing the session id, which travels in every packet, is not enough
+  to inject inputs.
+- **The handshake pins the simulation.** Core name and version, content SHA-256, core-options hash,
+  state size and the initial state checksum must match (`RollbackSession.validate`). An empty content
+  hash means the check is skipped, which is why `ConsoleRollbackCore` refuses a blank one.
+- **The inputs are validated.** A blob that lies about its size is dropped (`decodeInput`), and the
+  adapter clamps decoded touch coordinates to the console's screens before they reach the core.
+- **A divergent simulation stops the session** in the two-controller topology: both peers run the same
+  console, so each frame's settled state checksum must match (`RollbackEvent.Desync`).
+
+What it cannot do, and what that means for online play:
+
+- **Linked play has no state-desync detection.** Two consoles, one per peer, legitimately hold
+  different RAM, so a same-simulation checksum would be a false alarm (`RollbackConfig.linkChecksums`
+  is off for that reason). The link traffic is frame-scheduled and redundant, but nothing in the
+  protocol can prove the other console was not modified locally.
+- **A modified local client can cheat.** P2P rollback has no authority: a peer can patch its own
+  emulator, and only a relay that validates the stream, a signed client attestation, or server-side
+  replay verification of the input log can catch that. Those belong to the matchmaking tier, not to
+  this engine.
+- **Fair information is a host concern.** The engine cannot know whether an AI was given more than a
+  human could see; the host has to constrain what its agent may read.
 
 ## Not included (yet)
 

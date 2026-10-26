@@ -16,8 +16,8 @@ import kotlin.test.assertTrue
  */
 class LinkedSessionTest {
 
-    private class LinkedCore(private val leader: Boolean, private val radio: LinkRadio) : RollbackCore {
-        private val inner = FakeCore()
+    private class LinkedCore(private val leader: Boolean, private val radio: LinkRadio, divergeAt: Int = -1) : RollbackCore {
+        private val inner = FakeCore(divergeAt = divergeAt)
         private var frame = 0
         private var seq = 0
         private var pendingAck = false
@@ -114,12 +114,13 @@ class LinkedSessionTest {
         latencyFrames: Int = 0,
         dropEveryA: Int = 0,
         dropEveryB: Int = 0,
+        divergeB: Int = -1,
     ) {
         val events = mutableListOf<RollbackEvent>()
         val radioA = LinkRadio(config.linkQueueDepth)
         val radioB = LinkRadio(config.linkQueueDepth)
         val coreA = LinkedCore(leader = true, radio = radioA)
-        val coreB = LinkedCore(leader = false, radio = radioB)
+        val coreB = LinkedCore(leader = false, radio = radioB, divergeAt = divergeB)
         val transportA = SimulatedTransport(
             Endpoint("a", 7000),
             latencyFrames = latencyFrames,
@@ -423,6 +424,44 @@ class LinkedSessionTest {
         assertTrue(
             failure.reason.contains("linked play"),
             "the reason should mention linked play: ${failure.reason}",
+        )
+        harness.close()
+    }
+
+    /**
+     * A real linked session runs two *different* consoles: their RAM legitimately differs (each game
+     * holds its own player's data), so the same-simulation checksum comparison of the two-controller
+     * topology must not apply. Before [RollbackConfig.linkChecksums], a real wireless session would
+     * have been reported as a desync as soon as the two consoles disagreed — something the deterministic
+     * echo cores of the other tests cannot show.
+     */
+    @Test
+    fun twoDifferentConsolesDoNotReportAFalseDesync() {
+        val config = linkedConfig(delay = 4)
+        val harness = Harness(config, divergeB = 40)
+        harness.start()
+        assertTrue(harness.handshake(), "the linked pair did not synchronize")
+        assertEquals(200, harness.run(200), harness.diagnostics())
+        assertEquals(
+            emptyList(),
+            harness.events.filter { it is RollbackEvent.Desync },
+            "two different consoles must not be compared frame by frame: ${harness.diagnostics()}",
+        )
+        assertTrue(harness.sessionA.isSynchronized && harness.sessionB.isSynchronized)
+        harness.close()
+    }
+
+    /** With `linkChecksums` on, the same divergence *is* reported: that is what the flag is for. */
+    @Test
+    fun linkChecksumsStillCatchDivergentConsolesWhenEnabled() {
+        val config = linkedConfig(delay = 4).copy(linkChecksums = true)
+        val harness = Harness(config, divergeB = 40)
+        harness.start()
+        assertTrue(harness.handshake(), "the linked pair did not synchronize")
+        harness.run(200)
+        assertTrue(
+            harness.events.any { it is RollbackEvent.Desync },
+            "expected a desync with linkChecksums on, got ${harness.events.distinct()}",
         )
         harness.close()
     }
