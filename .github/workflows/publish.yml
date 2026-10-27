@@ -1,0 +1,36 @@
+# Publishes the engine to GitHub Packages, so anything consuming it (pokemon-client-rollback, the app) can resolve
+# `dev.kotlinds:libretro-rollback:0.1.0-SNAPSHOT` from a clean clone instead of a local `publishToMavenLocal`.
+#
+# Run it from Actions → publish → Run workflow, or push a tag: a release is what the app pins, a branch push is not.
+name: publish
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write # publish to GitHub Packages
+
+jobs:
+  github-packages:
+    name: GitHub Packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up the JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish the engine
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew --no-daemon publishAllPublicationsToGitHubPackagesRepository
