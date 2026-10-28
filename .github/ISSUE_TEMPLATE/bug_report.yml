@@ -1,0 +1,82 @@
+name: Bug report
+description: A desync, a rollback that misfires, a peer that cannot join, a link that will not connect
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The engine is at fault when the *two sessions disagree*, when a rollback produces a different frame than the
+        original, or when a handshake/join fails for a reason that is not a real mismatch. If the game itself behaves
+        wrongly on one machine, that is more likely the app or the core: report it on
+        [ai-plays-online](https://github.com/SamurAI-Official/ai-plays-online/issues).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: |
+        The event that came out (desync at frame N, handshake failed, disconnected, prediction threshold, link rollback
+        refused) and what you expected instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topology
+    attributes:
+      label: How were the peers connected?
+      options:
+        - Two processes on one machine (loopback)
+        - Two machines on a LAN
+        - Over the internet
+        - In-process, from a test
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options: [Rollback, Lockstep, Both]
+    validations:
+      required: true
+
+  - type: input
+    id: core-and-game
+    attributes:
+      label: Core and game
+      description: Which core build (e.g. melonDS rollback, fixed RTC) and which game/ROM code.
+      placeholder: melonds_libretro_rollback + Pokémon HeartGold (IPKE)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: 0.1.0-SNAPSHOT / 5f7055e
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Session log and reproduction
+      description: |
+        The events from both sides, the frame numbers, the state size, whether it is repeatable, and any packet loss or
+        latency you introduced (we test with artificial loss, so a number helps).
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before filing
+      options:
+        - label: I dumped the ROM myself (no game, BIOS or firmware is included, and we cannot help with ROMs)
+          required: true
+        - label: I searched the existing issues for this
+          required: true
+        - label: This is not a security issue
+          required: true
